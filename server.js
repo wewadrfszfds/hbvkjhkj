@@ -3364,21 +3364,85 @@ async function handleDeleteLotteryTicket(env, ctx) {
 }
 
 // ════════════════════════════════════════════════════════════════════
+//  بوابة الإعلان الإجباري (Mandatory Ad Gate)
+//  الأكشنات المحمية (المطالبة باليومي، البرومو كود، التعدين، المهام، السحب)
+//  لا تُنفّذ إلا لو الطلب معاه adGate: تذكرة وحيدة الاستخدام صدرت من
+//  /adGateStart قبل عرض الإعلان، ومرّ عليها وقت معقول (يعني الإعلان اتعرض
+//  فعلًا) ومربوطة بنفس المستخدم ونفس الأكشن ونفس بصمة الجهاز.
+//  بدون التذكرة أي سكريبت ينادي الإندبوينت مباشرة بيترفض.
+// ════════════════════════════════════════════════════════════════════
+const AD_GATE_TTL_MS = 3 * 60 * 1000;   // صلاحية التذكرة: 3 دقايق
+const AD_GATE_MIN_MS = 3000;            // أقل وقت بين إصدار التذكرة واستخدامها
+const AD_GATE_ACTIONS = new Set([
+  'claimDailyBonus', 'redeemCode', 'claimMining',
+  'verifyTask', 'claimTask', 'requestWithdrawal',
+]);
+const adGateStore = new Map();          // ticket -> { telegramId, gate, fingerprint, issuedAt, expireAt }
+
+function cleanupExpiredAdGates() {
+  const now = Date.now();
+  for (const [ticket, rec] of adGateStore) {
+    if (rec.expireAt < now) adGateStore.delete(ticket);
+  }
+}
+
+// POST /adGateStart  { gate: 'claimMining' | ... }  ->  { gate: <ticket> }
+async function handleAdGateStart(env, ctx) {
+  const { user, body } = ctx;
+  const gate = String(body.gate || '');
+  if (!AD_GATE_ACTIONS.has(gate)) return fail('Unsupported action');
+  cleanupExpiredAdGates();
+  const issuedAt = Date.now();
+  const ticket = generateAdTicket();
+  adGateStore.set(ticket, {
+    telegramId: String(user.telegramId),
+    gate,
+    fingerprint: afSanitiseKey(body._deviceFingerprint, 64) || 'missing',
+    issuedAt,
+    expireAt: issuedAt + AD_GATE_TTL_MS,
+  });
+  return ok({ gate: ticket, expiresInMs: AD_GATE_TTL_MS });
+}
+
+// يلف أي handler: يتحقق من التذكرة (ويحذفها فورًا = single-use) قبل التنفيذ
+function withAdGate(gate, handler) {
+  return async function (env, ctx) {
+    const ticket = String(ctx.body.adGate || '');
+    const rec = ticket ? adGateStore.get(ticket) : null;
+    if (!rec) return fail('Please watch the ad first', 403);
+    adGateStore.delete(ticket);
+    if (rec.expireAt < Date.now()) return fail('Ad session expired. Please watch the ad again.', 403);
+    if (rec.telegramId !== String(ctx.user.telegramId) || rec.gate !== gate) {
+      return fail('Ad verification failed. Please watch the ad again.', 403);
+    }
+    const fp = afSanitiseKey(ctx.body._deviceFingerprint, 64) || 'missing';
+    if (rec.fingerprint !== 'missing' && fp !== 'missing' && rec.fingerprint !== fp) {
+      return fail('Ad verification failed. Please watch the ad again.', 403);
+    }
+    if (Date.now() - rec.issuedAt < AD_GATE_MIN_MS) {
+      return fail('Ad was not watched completely. Please try again.', 403);
+    }
+    return handler(env, ctx);
+  };
+}
+
+// ════════════════════════════════════════════════════════════════════
 //  جدول التوجيه (Routing Table)
 // ════════════════════════════════════════════════════════════════════
 const ROUTES = {
   '/getState': handleGetState,
   '/heartbeat': handleHeartbeat,
-  '/claimDailyBonus': handleClaimDailyBonus,
-  '/redeemCode': handleRedeemCode,
+  '/claimDailyBonus': withAdGate('claimDailyBonus', handleClaimDailyBonus),
+  '/redeemCode': withAdGate('redeemCode', handleRedeemCode),
   '/checkSession': handleStartAdView,
+  '/adGateStart': handleAdGateStart,
   '/syncBalance': handleClaimAdReward,
   '/sessionSync': handleSessionSync,
   '/startMining': handleStartMining,
-  '/claimMining': handleClaimMining,
+  '/claimMining': withAdGate('claimMining', handleClaimMining),
   '/startTask': handleStartTask,
-  '/verifyTask': handleVerifyTask,
-  '/claimTask': handleClaimTask,
+  '/verifyTask': withAdGate('verifyTask', handleVerifyTask),
+  '/claimTask': withAdGate('claimTask', handleClaimTask),
   '/submitTaskSuggestion': handleSubmitTaskSuggestion,
   '/checkCombo': handleCheckCombo,
   '/collectReferralEarnings': handleCollectReferralEarnings,
@@ -3386,7 +3450,7 @@ const ROUTES = {
   '/getReferrals': handleGetReferrals,
   '/getWeeklyLeaderboard': handleGetWeeklyLeaderboard,
   '/checkForceSub': handleCheckForceSub,
-  '/requestWithdrawal': handleRequestWithdrawal,
+  '/requestWithdrawal': withAdGate('requestWithdrawal', handleRequestWithdrawal),
   '/createDeposit': handleCreateDeposit,
   '/verifyDeposit': handleVerifyDeposit,
   '/convertCrystalToTon': handleConvertCrystalToTon,
