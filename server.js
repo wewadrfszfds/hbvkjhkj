@@ -3375,7 +3375,7 @@ const AD_GATE_TTL_MS = 3 * 60 * 1000;   // صلاحية التذكرة: 3 دقا
 const AD_GATE_MIN_MS = 3000;            // أقل وقت بين إصدار التذكرة واستخدامها
 const AD_GATE_ACTIONS = new Set([
   'claimDailyBonus', 'redeemCode', 'claimMining',
-  'verifyTask', 'claimTask', 'requestWithdrawal',
+  'verifyTask', 'claimTask', 'requestWithdrawal', 'checkCombo',
 ]);
 const adGateStore = new Map();          // ticket -> { telegramId, gate, fingerprint, issuedAt, expireAt }
 
@@ -3444,7 +3444,7 @@ const ROUTES = {
   '/verifyTask': withAdGate('verifyTask', handleVerifyTask),
   '/claimTask': withAdGate('claimTask', handleClaimTask),
   '/submitTaskSuggestion': handleSubmitTaskSuggestion,
-  '/checkCombo': handleCheckCombo,
+  '/checkCombo': withAdGate('checkCombo', handleCheckCombo),
   '/collectReferralEarnings': handleCollectReferralEarnings,
   '/spinWheel': handleSpinWheel,
   '/getReferrals': handleGetReferrals,
