@@ -3379,6 +3379,7 @@ const AD_GATE_ACTIONS = new Set([
   'claimDailyBonus', 'redeemCode', 'claimMining',
   'verifyTask', 'claimTask', 'requestWithdrawal', 'checkCombo',
 ]);
+const AD_GATE_MIN_MS_BY_GATE = { verifyTask: 15000 };   // زرار إكمال المهمة: لازم 15 ثانية مشاهدة على الأقل
 const adGateStore = new Map();          // ticket -> { telegramId, gate, fingerprint, issuedAt, expireAt }
 
 function cleanupExpiredAdGates() {
@@ -3421,7 +3422,7 @@ function withAdGate(gate, handler) {
     if (rec.fingerprint !== 'missing' && fp !== 'missing' && rec.fingerprint !== fp) {
       return fail('Ad verification failed. Please watch the ad again.', 403);
     }
-    if (Date.now() - rec.issuedAt < AD_GATE_MIN_MS) {
+    if (Date.now() - rec.issuedAt < (AD_GATE_MIN_MS_BY_GATE[gate] || AD_GATE_MIN_MS)) {
       return fail('Ad was not watched completely. Please try again.', 403);
     }
     return handler(env, ctx);
