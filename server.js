@@ -1992,7 +1992,9 @@ async function handleClaimAdReward(env, ctx) {
   // قصير من الأساس). ده مش دليل تلاعب في حد ذاته — فبنرجّع فشل عادي
   // برسالة واضحة للمستخدم بدل ما نحظر الحساب، وهو يقدر يعيد المحاولة
   // بإعلان تاني.
-  const minWatchMs = Math.max(0, Number(config.adMinWatchMs ?? DEFAULT_CONFIG.adMinWatchMs ?? 5000));
+  let minWatchMs = Math.max(0, Number(config.adMinWatchMs ?? DEFAULT_CONFIG.adMinWatchMs ?? 5000));
+  // Adloop: لازم المستخدم يشوف الإعلان 15 ثانية على الأقل (لو قفله/تخطاه قبل كده = مفيش مكافأة)
+  if (company === 'adloop') minWatchMs = Math.max(minWatchMs, 15000);
   if (minWatchMs > 0 && Date.now() - record.issuedAt < minWatchMs) {
     const minWatchSeconds = Math.ceil(minWatchMs / 1000);
     return fail(`Please stay on the ad for at least ${minWatchSeconds} seconds to earn the reward`, 400);
