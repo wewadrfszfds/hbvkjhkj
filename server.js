@@ -3430,24 +3430,79 @@ function withAdGate(gate, handler) {
 }
 
 // ════════════════════════════════════════════════════════════════════
+//  كابتشا Cloudflare Turnstile إجبارية على الأكشنات الحساسة
+//  (استلام التعدين، Daily Bonus، Daily Combo، مهام انضمام البوتات).
+//  بتتنفّذ *قبل* withAdGate وقبل أي منطق، فلو التوكن ناقص/غلط/منتهي
+//  السيرفر بيرفض الطلب برد requiresCaptcha:true، وتذكرة الإعلان (adGate)
+//  بتفضل سليمة (مش بتتحرق) عشان الواجهة تعيد نفس الطلب بعد حل الكابتشا.
+//  كل أكشن له Turnstile action خاص، فمينفعش توكن اتحل لأكشن يتستخدم في
+//  أكشن تاني. التوكن single-use من Cloudflare نفسه.
+//  shouldRequire (اختياري): دالة async (env, ctx) => boolean لتحديد هل
+//  الكابتشا مطلوبة للطلب ده (مثلًا مهام البوتات فقط).
+// ════════════════════════════════════════════════════════════════════
+const CAPTCHA_ACTIONS = {
+  claimMining: 'claim_mining',
+  claimDailyBonus: 'daily_bonus',
+  checkCombo: 'daily_combo',
+  verifyTask: 'bot_task',
+};
+
+function withCaptcha(gate, handler, shouldRequire) {
+  const expectedAction = CAPTCHA_ACTIONS[gate];
+  return async function (env, ctx) {
+    // لو تذكرة الإعلان أصلًا مش موجودة نرفض بدون ما نضيّع حل كابتشا على المستخدم
+    const ticket = String(ctx.body.adGate || '');
+    if (!ticket || !adGateStore.has(ticket)) {
+      return fail('Please watch the ad first', 403);
+    }
+    if (shouldRequire) {
+      let required = true;
+      try { required = await shouldRequire(env, ctx); } catch (_) { required = true; }
+      if (!required) return handler(env, ctx);
+    }
+    const { config } = ctx;
+    const secretKey = config.turnstileSecretKey || env.TURNSTILE_SECRET_KEY || DEFAULT_CONFIG.turnstileSecretKey;
+    const verify = await verifyTurnstile(ctx.body.turnstileToken, ctx.ip, secretKey, {
+      expectedHostname: config.turnstileExpectedHostname || undefined,
+      expectedAction,
+    });
+    if (!verify.success) {
+      return failCaptcha('You must pass the security check (Captcha) to continue');
+    }
+    // التوكن اتحرق عند Cloudflare؛ نمسحه من الطلب عشان ميتستخدمش تاني بالغلط
+    delete ctx.body.turnstileToken;
+    return handler(env, ctx);
+  };
+}
+
+// مهام انضمام البوتات بس هي اللي بتطلب كابتشا (مهام القنوات لأ).
+// عشان تفرضها على كل المهام: غيّر الدالة لـ async () => true
+async function taskNeedsCaptcha(env, ctx) {
+  const taskId = ctx.body && ctx.body.taskId;
+  if (!isNonEmptyString(taskId, 100)) return false;   // handler هيرفض الطلب أصلًا
+  const task = await dbGet(env, `tasks/${taskId}`);
+  return isBotStyleTask(task);
+}
+
+// ════════════════════════════════════════════════════════════════════
 //  جدول التوجيه (Routing Table)
 // ════════════════════════════════════════════════════════════════════
 const ROUTES = {
   '/getState': handleGetState,
   '/heartbeat': handleHeartbeat,
-  '/claimDailyBonus': withAdGate('claimDailyBonus', handleClaimDailyBonus),
+  '/claimDailyBonus': withCaptcha('claimDailyBonus', withAdGate('claimDailyBonus', handleClaimDailyBonus)),
   '/redeemCode': withAdGate('redeemCode', handleRedeemCode),
   '/checkSession': handleStartAdView,
   '/adGateStart': handleAdGateStart,
   '/syncBalance': handleClaimAdReward,
   '/sessionSync': handleSessionSync,
   '/startMining': handleStartMining,
-  '/claimMining': withAdGate('claimMining', handleClaimMining),
+  '/claimMining': withCaptcha('claimMining', withAdGate('claimMining', handleClaimMining)),
   '/startTask': handleStartTask,
-  '/verifyTask': withAdGate('verifyTask', handleVerifyTask),
+  '/verifyTask': withCaptcha('verifyTask', withAdGate('verifyTask', handleVerifyTask), taskNeedsCaptcha),
   '/claimTask': withAdGate('claimTask', handleClaimTask),
   '/submitTaskSuggestion': handleSubmitTaskSuggestion,
-  '/checkCombo': withAdGate('checkCombo', handleCheckCombo),
+  '/checkCombo': withCaptcha('checkCombo', withAdGate('checkCombo', handleCheckCombo)),
   '/collectReferralEarnings': handleCollectReferralEarnings,
   '/spinWheel': handleSpinWheel,
   '/getReferrals': handleGetReferrals,
