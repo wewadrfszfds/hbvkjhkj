@@ -2236,6 +2236,12 @@ async function handleBuyCrystalWithTon(env, ctx) {
   if (tonAmount > tonBalance) return fail('Insufficient TON balance.');
   const crystalAdded = tonAmount * rate;
   const crystalBalance = Number(freshUser?.balance || 0) + crystalAdded;
+  // عمولة الإحالة تُحسب فقط على شراء باقة من المتجر (مش على تحويل TON -> CRYSTAL من صفحة Convert):
+  // لازم الطلب يكون purchaseType:'package' وكمية الـ TON تساوي سعر باقة فعلية من config.storePacks.
+  const storePacks = (Array.isArray(config.storePacks) && config.storePacks.length
+    ? config.storePacks : DEFAULT_CONFIG.storePacks).map(Number);
+  const isPackagePurchase = String(body.purchaseType || '') === 'package'
+    && storePacks.some((p) => Math.abs(p - tonAmount) < 1e-9);
   const miningRate = Number(config.miningRatePerCrystal ?? DEFAULT_CONFIG.miningRatePerCrystal);
   const nowTs = Date.now();
   // مخزون التعدين بيتحفظ في miningPendingTon (مش بيتحوّل لرصيد TON ومش بيتصفّر)
@@ -2250,6 +2256,7 @@ async function handleBuyCrystalWithTon(env, ctx) {
     amount: crystalAdded,
     currency: 'CRYSTAL',
     tonSpent: tonAmount,
+    purchaseType: isPackagePurchase ? 'package' : 'convert',
     ts: Date.now(),
   });
 
@@ -2260,7 +2267,7 @@ async function handleBuyCrystalWithTon(env, ctx) {
   // مثال: شراء 1000 كريستال (1 TON) => 100 كريستال للمُحيل.
   // كل خطوة مستقلة (try/catch لوحدها) عشان فشل أي جزء ما يمنعش الباقي،
   // وأي خطأ بيتسجل في console.error بدل ما يتبلع.
-  const referrerId = await resolveReferrerId(env, user.telegramId, freshUser || user);
+  const referrerId = isPackagePurchase ? await resolveReferrerId(env, user.telegramId, freshUser || user) : '';
   if (referrerId && referrerId !== String(user.telegramId)) {
     const pct = Number(config?.depositCommissionPct ?? DEFAULT_CONFIG.depositCommissionPct);
     const commission = Number((crystalAdded * (pct / 100)).toFixed(4));
@@ -2303,7 +2310,7 @@ async function handleBuyCrystalWithTon(env, ctx) {
       }
     }
   } else {
-    console.log('[referral] buyer has no referrer, no commission', String(user.telegramId));
+    console.log('[referral] no commission', String(user.telegramId), isPackagePurchase ? '(no referrer)' : '(not a store package purchase)');
   }
 
   return ok({
