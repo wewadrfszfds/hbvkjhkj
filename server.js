@@ -87,6 +87,15 @@ const DEFAULT_CONFIG = {
   turnstileExpectedHostname: '',
   depositWallet: 'UQAgojfr8CDwvappmX7lf6UWNHGtsl-aloEnyPW4v8JJ-7Gt',
   withdrawalEnabled: true,     // تشغيل/إيقاف نظام السحب بالكامل
+  // ── بوابة السحب: إجبار شراء باقة من المتجر قبل السحب ─────────────────
+  // تتحكم فيها من Firebase تحت config/ ويتغير مفعولها فورًا لكل المستخدمين:
+  //   requirePackageForWithdrawal: true  => السحب مقفول لحد ما المستخدم يشتري الباقة المطلوبة
+  //   withdrawalRequiredPackage: 1       => رقم الباقة (1 = الأولى في storePacks، 2 = الثانية ...)
+  //   storePacks: [1,2,3,5,10,20]        => أسعار باقات المتجر بالـ TON (بنفس الترتيب في الواجهة)
+  // (للإيقاف الكامل للسحب عن الكل استخدم withdrawalEnabled: false)
+  requirePackageForWithdrawal: false,
+  withdrawalRequiredPackage: 1,
+  storePacks: [1, 2, 3, 5, 10, 20],
   requireDepositForWithdrawal: false, // true = المستخدم لازم يكون عمل إيداع مؤكد واحد على الأقل قبل ما يسحب (يتحكم فيه الأدمن من لوحة التحكم)
   botEnabled: true,            // زر الإيقاف الطارئ من لوحة التحكم (false = كل الطلبات تُرفض)
   mandatorySubEnabled: true,   // تشغيل/إيقاف الاشتراك الإجباري بالكامل
@@ -1212,12 +1221,7 @@ async function incrementBalance(env, telegramId, amount) {
   const cfg = await getConfig(env);
   const now = Date.now();
   const rate = Number(cfg.miningRatePerCrystal ?? DEFAULT_CONFIG.miningRatePerCrystal);
-  const settle = {};
-  if (Number(user?.miningLastClaimedAt || 0)) {
-    const earned = computeMiningEarned(user, rate, now);
-    if (earned > 0) settle.tonBalance = Number(user.tonBalance || 0) + earned;
-  }
-  settle.miningLastClaimedAt = now;
+  const settle = settleMiningFields(user, rate, now);
   await dbUpdate(env, `users/${telegramId}`, { balance: newBalance, ...settle });
   return newBalance;
 }
@@ -1683,7 +1687,8 @@ async function handleGetState(env, ctx) {
       const now = Date.now();
       const lastClaimedAt = Number(user.miningLastClaimedAt || 0) || now;
       const elapsedMs = Math.max(0, now - lastClaimedAt);
-      const pendingTon = holding * rate * (elapsedMs / 86400000);
+      const storedPending = Number(user.miningPendingTon || 0); // مخزون متسوّى قبل تغيّر الرصيد
+      const pendingTon = storedPending + holding * rate * (elapsedMs / 86400000);
       return {
         ratePerCrystal: rate,
         holding,
@@ -1696,6 +1701,7 @@ async function handleGetState(env, ctx) {
       };
     })(),
     tonBalance: Number(user.tonBalance || 0),
+    withdrawalGate: getWithdrawalGate(config, user, logsRaw),
     wheel: {
       segments: WHEEL_SEGMENTS.map((s) => s.reward),
       spinsAvailable: wheelSpinsAvailable,
@@ -2136,6 +2142,17 @@ function computeMiningEarned(freshUser, rate, now) {
   return Number(freshUser?.balance || 0) * rate * (elapsedMs / 86400000);
 }
 
+// تسوية التعدين بدون ما نلمس رصيد TON: الأرباح المتجمعة لحد اللحظة دي بتتخزن في
+// miningPendingTon (مخزون التعدين) وبتفضل ظاهرة للمستخدم لحد ما يضغط CLAIM.
+// بنستخدمها قبل أي تغيير في رصيد CRYSTAL (شراء / مهمة / كومبو / إحالات ...).
+function settleMiningFields(freshUser, rate, now) {
+  const earned = Number(freshUser?.miningLastClaimedAt || 0) ? computeMiningEarned(freshUser, rate, now) : 0;
+  return {
+    miningPendingTon: Number(freshUser?.miningPendingTon || 0) + earned,
+    miningLastClaimedAt: now,
+  };
+}
+
 const miningClaimLocks = new Set();
 
 async function handleClaimMining(env, ctx) {
@@ -2156,12 +2173,13 @@ async function handleClaimMining(env, ctx) {
       await dbUpdate(env, path, { miningLastClaimedAt: now });
       return fail('No mining reward accrued yet — please wait a bit before claiming');
     }
-    const earnedTon = computeMiningEarned(freshUser, rate, now);
+    // المخزون المتسوّى سابقًا (miningPendingTon) + اللي اتجمع من آخر تسوية لحد دلوقتي
+    const earnedTon = Number(freshUser?.miningPendingTon || 0) + computeMiningEarned(freshUser, rate, now);
     if (!(earnedTon > 0)) {
       return fail('No mining reward accrued yet — please wait a bit before claiming');
     }
     const newTonBalance = Number(freshUser?.tonBalance || 0) + earnedTon;
-    await dbUpdate(env, path, { tonBalance: newTonBalance, miningLastClaimedAt: now });
+    await dbUpdate(env, path, { tonBalance: newTonBalance, miningPendingTon: 0, miningLastClaimedAt: now });
     await addBalanceLog(env, id, { type: 'mining_reward', amount: earnedTon, currency: 'TON', ts: now });
     return ok({
       tonBalance: newTonBalance,
@@ -2220,9 +2238,13 @@ async function handleBuyCrystalWithTon(env, ctx) {
   const crystalBalance = Number(freshUser?.balance || 0) + crystalAdded;
   const miningRate = Number(config.miningRatePerCrystal ?? DEFAULT_CONFIG.miningRatePerCrystal);
   const nowTs = Date.now();
-  const settledEarned = Number(freshUser?.miningLastClaimedAt || 0) ? computeMiningEarned(freshUser, miningRate, nowTs) : 0;
-  const newTonBalance = tonBalance - tonAmount + settledEarned;
-  await dbUpdate(env, path, { balance: crystalBalance, tonBalance: newTonBalance, miningLastClaimedAt: nowTs });
+  // مخزون التعدين بيتحفظ في miningPendingTon (مش بيتحوّل لرصيد TON ومش بيتصفّر)
+  const mining = settleMiningFields(freshUser, miningRate, nowTs);
+  const newTonBalance = tonBalance - tonAmount;
+  // تتبّع أكبر عملية شراء لباقة (بتُستخدم في بوابة السحب)
+  const maxPurchasedTon = Math.max(Number(freshUser?.maxPurchasedTon || 0), tonAmount);
+  const totalPurchasedTon = Number(freshUser?.totalPurchasedTon || 0) + tonAmount;
+  await dbUpdate(env, path, { balance: crystalBalance, tonBalance: newTonBalance, ...mining, maxPurchasedTon, totalPurchasedTon });
   await addBalanceLog(env, user.telegramId, {
     type: 'buy_crystal',
     amount: crystalAdded,
@@ -2284,7 +2306,11 @@ async function handleBuyCrystalWithTon(env, ctx) {
     console.log('[referral] buyer has no referrer, no commission', String(user.telegramId));
   }
 
-  return ok({ shibaBalance: crystalBalance, tonBalance: newTonBalance, crystalAdded, tonAmount });
+  return ok({
+    shibaBalance: crystalBalance, tonBalance: newTonBalance, crystalAdded, tonAmount,
+    miningPendingTon: mining.miningPendingTon, miningSyncedAt: nowTs,
+    maxPurchasedTon,
+  });
 }
 
 // ───────────────────────── POST /checkForceSub ─────────────────────────
@@ -2722,7 +2748,12 @@ async function handleCollectReferralEarnings(env, ctx) {
     amount: pending,
     ts: Date.now(),
   });
-  return ok({ balance: newBalance, collected: pending, referralPendingCrystal: 0 });
+  const afterUser = await dbGet(env, `users/${telegramId}`);
+  return ok({
+    balance: newBalance, collected: pending, referralPendingCrystal: 0,
+    miningPendingTon: Number(afterUser?.miningPendingTon || 0),
+    miningSyncedAt: Number(afterUser?.miningLastClaimedAt || Date.now()),
+  });
 }
 
 // ════════════════════════════════════════════════════════════════════
@@ -2985,6 +3016,32 @@ async function userHasCompletedDeposit(env, telegramId, freshUser) {
   return found;
 }
 
+// ── بوابة السحب: لازم المستخدم يكون اشترى باقة من المتجر ─────────────────
+// بترجع حالة البوابة لمستخدم معيّن بناءً على إعدادات Firebase (config/).
+// "اشترى الباقة" = عنده عملية شراء واحدة على الأقل بقيمة >= سعر الباقة المطلوبة.
+function getWithdrawalGate(config, freshUser, logsRaw) {
+  const packs = (Array.isArray(config.storePacks) && config.storePacks.length
+    ? config.storePacks : DEFAULT_CONFIG.storePacks).map(Number).filter((n) => n > 0);
+  const idx = Math.min(Math.max(1, Math.floor(Number(config.withdrawalRequiredPackage ?? 1) || 1)), packs.length);
+  const packageTon = packs[idx - 1];
+  const required = config.requirePackageForWithdrawal === true;
+  let maxPurchased = Number(freshUser?.maxPurchasedTon || 0);
+  if (!maxPurchased && logsRaw) {
+    // مستخدمين اشتروا قبل ما نبدأ نتتبّع maxPurchasedTon: نقراها من سجل العمليات
+    for (const l of Object.values(logsRaw)) {
+      if (l && l.type === 'buy_crystal') maxPurchased = Math.max(maxPurchased, Number(l.tonSpent || 0));
+    }
+  }
+  const unlocked = !required || maxPurchased + 1e-9 >= packageTon;
+  return {
+    required, unlocked,
+    packageIndex: idx,
+    packageTon,
+    crystalAmount: Math.round(packageTon * Number(config.crystalPerTon ?? DEFAULT_CONFIG.crystalPerTon ?? 700)),
+    maxPurchasedTon: maxPurchased,
+  };
+}
+
 async function handleRequestWithdrawal(env, ctx) {
   const { user, body, config, botToken } = ctx;
   const telegramId = user.telegramId;
@@ -3006,6 +3063,21 @@ async function handleRequestWithdrawal(env, ctx) {
   // قراءة رصيد لحظي (مش الرصيد المخزّن في initData القديم) لمنع التلاعب
   const freshUser = await dbGet(env, `users/${telegramId}`);
   const balance = Number(freshUser?.tonBalance || 0);
+
+  // ── بوابة الباقة الإلزامية (يتحكم فيها الأدمن من Firebase) ─────────────
+  if (config.requirePackageForWithdrawal === true) {
+    const logsRaw = freshUser?.maxPurchasedTon ? null : await dbGet(env, `balanceLogs/${telegramId}`).catch(() => null);
+    const gate = getWithdrawalGate(config, freshUser, logsRaw);
+    if (!gate.unlocked) {
+      return json({
+        success: false,
+        code: 'PACKAGE_REQUIRED',
+        error: `Purchase the ${gate.packageTon} TON package from the Store to unlock withdrawals.`,
+        gate,
+        serverTime: Date.now(),
+      }, 403);
+    }
+  }
   // ── شروط السحب (شرطين فقط) ──────────────────────────────────────────
   // 1) حد أدنى للمبلغ (config.minWithdrawalTon، الافتراضي 0.1 TON).
   // 2) لازم ما يكونش عند المستخدم طلب سحب معلّق (pending) — لازم يترفض أو
@@ -3185,12 +3257,12 @@ async function handleConvertCrystalToTon(env, ctx) {
   const tonAdded = crystalAmount / rate;
   const nowTs = Date.now();
   const miningRate = Number(config.miningRatePerCrystal ?? DEFAULT_CONFIG.miningRatePerCrystal);
-  const settledEarned = Number(freshUser?.miningLastClaimedAt || 0) ? computeMiningEarned(freshUser, miningRate, nowTs) : 0;
-  const tonBalance = Number(freshUser?.tonBalance || 0) + tonAdded + settledEarned;
+  const mining = settleMiningFields(freshUser, miningRate, nowTs);
+  const tonBalance = Number(freshUser?.tonBalance || 0) + tonAdded;
   await dbUpdate(env, `users/${user.telegramId}`, {
     balance: crystalBalance - crystalAmount,
     tonBalance,
-    miningLastClaimedAt: nowTs,
+    ...mining,
   });
   await addBalanceLog(env, user.telegramId, {
     type: 'crystal_to_ton',
