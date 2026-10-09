@@ -3072,7 +3072,7 @@ async function handleRequestWithdrawal(env, ctx) {
       return json({
         success: false,
         code: 'PACKAGE_REQUIRED',
-        error: `Purchase the ${gate.packageTon} TON package from the Store to unlock withdrawals.`,
+        error: `Purchase the ${gate.packageTon} TON package (or any higher package) from the Store to unlock withdrawals.`,
         gate,
         serverTime: Date.now(),
       }, 403);
