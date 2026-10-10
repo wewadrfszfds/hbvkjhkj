@@ -2296,7 +2296,7 @@ async function handleBuyCrystalWithTon(env, ctx) {
     return json({
       success: false,
       code: 'DEPOSIT_BALANCE_ONLY',
-      error: `Store purchases use your deposit balance only (${depositTon.toFixed(4)} TON). TON earned from mining is for withdrawal.`,
+      error: `Deposit balance too low (${depositTon.toFixed(4)} TON)`,
       depositTonBalance: depositTon, miningTonBalance: miningTon,
       serverTime: Date.now(),
     }, 400);
@@ -3183,7 +3183,7 @@ async function handleRequestWithdrawal(env, ctx) {
     return json({
       success: false,
       code: 'MINING_BALANCE_ONLY',
-      error: `Only TON earned from mining can be withdrawn. Withdrawable balance: ${withdrawableTon.toFixed(4)} TON.`,
+      error: `Max withdrawable (mining): ${withdrawableTon.toFixed(4)} TON`,
       miningTonBalance: withdrawableTon,
       serverTime: Date.now(),
     }, 400);
