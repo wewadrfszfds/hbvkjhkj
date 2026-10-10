@@ -1226,6 +1226,46 @@ async function incrementBalance(env, telegramId, amount) {
   return newBalance;
 }
 
+// ───────────── رصيد TON: قسمين ─────────────
+// tonBalance        = إجمالي رصيد TON (إيداع + تعدين + أي مصدر تاني) — اللي بيظهر كإجمالي.
+// miningTonBalance  = الجزء المكتسب من التعدين (CLAIM) وده الوحيد المؤهل للسحب.
+// رصيد الإيداع/المصادر التانية = tonBalance - miningTonBalance، وده بس اللي يشتري بيه من المتجر.
+// أي إضافة لـ tonBalance من غير ما نلمس miningTonBalance (إيداع، جوايز، استرجاع...) بتدخل
+// تلقائيًا في رصيد الإيداع.
+function miningTonOf(user, logsRaw) {
+  const total = Math.max(0, Number(user?.tonBalance || 0));
+  if (user && user.miningTonBalance !== undefined && user.miningTonBalance !== null) {
+    return Math.min(Math.max(0, Number(user.miningTonBalance) || 0), total);
+  }
+  // مستخدم قديم لسه ما اتسجلش له الحقل: نقدّره من سجل مكافآت التعدين المتاحة (محدود بآخر العمليات)
+  let sum = 0;
+  if (logsRaw) {
+    for (const l of Object.values(logsRaw)) {
+      if (l && l.type === 'mining_reward') sum += Number(l.amount || 0);
+    }
+  }
+  return Math.min(sum, total);
+}
+// بيجيب رصيد التعدين القابل للسحب، ولو الحقل مش موجود بيحسبه ويحفظه مرة واحدة.
+async function loadMiningTon(env, telegramId, freshUser) {
+  if (freshUser && freshUser.miningTonBalance !== undefined && freshUser.miningTonBalance !== null) {
+    return miningTonOf(freshUser);
+  }
+  const logs = await dbGet(env, `balanceLogs/${telegramId}`).catch(() => null);
+  const m = miningTonOf(freshUser, logs);
+  await dbUpdate(env, `users/${telegramId}`, { miningTonBalance: m }).catch(() => {});
+  return m;
+}
+// الصرف العام (ترويج مهام، تذاكر...): من رصيد الإيداع الأول، وبعدين من رصيد التعدين.
+function spendTonSplit(total, mining, amount) {
+  const deposit = Math.max(0, total - mining);
+  const fromMining = Math.max(0, amount - deposit);
+  return {
+    tonBalance: Number((total - amount).toFixed(6)),
+    miningTonBalance: Number(Math.max(0, mining - fromMining).toFixed(6)),
+  };
+}
+
 async function chargeTonBalance(env, telegramId, amount) {
   const user = await dbGet(env, `users/${telegramId}`);
   const balance = Number(user?.tonBalance || 0);
@@ -1236,8 +1276,10 @@ async function chargeTonBalance(env, telegramId, amount) {
   if (balance < charge) {
     return { ok: false, error: `Insufficient TON balance. You need ${charge.toFixed(4)} TON.` };
   }
+  const miningNow = await loadMiningTon(env, telegramId, user);
+  const split = spendTonSplit(balance, miningNow, charge);
   const newBalance = Number((balance - charge).toFixed(4));
-  await dbUpdate(env, `users/${telegramId}`, { tonBalance: newBalance });
+  await dbUpdate(env, `users/${telegramId}`, { tonBalance: newBalance, miningTonBalance: split.miningTonBalance });
   await addBalanceLog(env, telegramId, {
     type: 'task_promotion_payment',
     amount: -charge,
@@ -1662,6 +1704,10 @@ async function handleGetState(env, ctx) {
     : [];
 
   // لا نرسل botToken أو turnstileSecretKey للواجهة الأمامية أبدًا — بيانات حساسة سيرفر فقط
+  if (user.miningTonBalance === undefined || user.miningTonBalance === null) {
+    // مستخدم قديم: نثبّت رصيد التعدين القابل للسحب مرة واحدة (مش بيتأخر عليه الرد)
+    dbUpdate(env, `users/${telegramId}`, { miningTonBalance: miningTonOf(user, logsRaw) }).catch(() => {});
+  }
   const clientConfig = { ...config };
   delete clientConfig.botToken;
   delete clientConfig.turnstileSecretKey;
@@ -1671,7 +1717,7 @@ async function handleGetState(env, ctx) {
   const wheelSpinsAvailable = computeSpinsAvailable(activeReferralsCount, wheelSpinsUsed);
 
   return ok({
-    user: { ...user, completedTasks },
+    user: { ...user, completedTasks, miningTonBalance: miningTonOf(user, logsRaw) },
     balance: user.balance || 0,
     tasks,
     completedTasks,
@@ -1702,6 +1748,11 @@ async function handleGetState(env, ctx) {
     })(),
     tonBalance: Number(user.tonBalance || 0),
     withdrawalGate: getWithdrawalGate(config, user, logsRaw),
+    tonBuckets: (() => {
+      const total = Number(user.tonBalance || 0);
+      const mining = miningTonOf(user, logsRaw);
+      return { total, withdrawable: mining, deposit: Math.max(0, total - mining) };
+    })(),
     wheel: {
       segments: WHEEL_SEGMENTS.map((s) => s.reward),
       spinsAvailable: wheelSpinsAvailable,
@@ -2179,10 +2230,14 @@ async function handleClaimMining(env, ctx) {
       return fail('No mining reward accrued yet — please wait a bit before claiming');
     }
     const newTonBalance = Number(freshUser?.tonBalance || 0) + earnedTon;
-    await dbUpdate(env, path, { tonBalance: newTonBalance, miningPendingTon: 0, miningLastClaimedAt: now });
+    // رصيد التعدين القابل للسحب بيزيد بقيمة الكليم (يتحسب قبل الإضافة عشان المستخدمين القدام)
+    const miningBefore = await loadMiningTon(env, id, freshUser);
+    const newMiningTon = miningBefore + earnedTon;
+    await dbUpdate(env, path, { tonBalance: newTonBalance, miningTonBalance: newMiningTon, miningPendingTon: 0, miningLastClaimedAt: now });
     await addBalanceLog(env, id, { type: 'mining_reward', amount: earnedTon, currency: 'TON', ts: now });
     return ok({
       tonBalance: newTonBalance,
+      miningTonBalance: newMiningTon,
       tonAdded: earnedTon,
       miningLastClaimedAt: now,
       dailyEarnedTon: Number(freshUser?.balance || 0) * rate,
@@ -2234,6 +2289,18 @@ async function handleBuyCrystalWithTon(env, ctx) {
   const freshUser = await dbGet(env, path);
   const tonBalance = Number(freshUser?.tonBalance || 0);
   if (tonAmount > tonBalance) return fail('Insufficient TON balance.');
+  // المتجر بيشتري بس من رصيد الإيداع/المصادر التانية — رصيد التعدين للسحب فقط
+  const miningTon = await loadMiningTon(env, user.telegramId, freshUser);
+  const depositTon = Math.max(0, tonBalance - miningTon);
+  if (tonAmount > depositTon + 1e-9) {
+    return json({
+      success: false,
+      code: 'DEPOSIT_BALANCE_ONLY',
+      error: `Store purchases use your deposit balance only (${depositTon.toFixed(4)} TON). TON earned from mining is for withdrawal.`,
+      depositTonBalance: depositTon, miningTonBalance: miningTon,
+      serverTime: Date.now(),
+    }, 400);
+  }
   const crystalAdded = tonAmount * rate;
   const crystalBalance = Number(freshUser?.balance || 0) + crystalAdded;
   // عمولة الإحالة تُحسب فقط على شراء باقة من المتجر (مش على تحويل TON -> CRYSTAL من صفحة Convert):
@@ -2314,7 +2381,7 @@ async function handleBuyCrystalWithTon(env, ctx) {
   }
 
   return ok({
-    shibaBalance: crystalBalance, tonBalance: newTonBalance, crystalAdded, tonAmount,
+    shibaBalance: crystalBalance, tonBalance: newTonBalance, miningTonBalance: miningTon, crystalAdded, tonAmount,
     miningPendingTon: mining.miningPendingTon, miningSyncedAt: nowTs,
     maxPurchasedTon,
   });
@@ -3110,14 +3177,27 @@ async function handleRequestWithdrawal(env, ctx) {
   if (amount > balance) {
     return fail('Insufficient TON balance.');
   }
+  // السحب بس من رصيد التعدين (المكتسب من CLAIM). رصيد الإيداع للشراء من المتجر.
+  const withdrawableTon = await loadMiningTon(env, telegramId, freshUser);
+  if (amount > withdrawableTon + 1e-9) {
+    return json({
+      success: false,
+      code: 'MINING_BALANCE_ONLY',
+      error: `Only TON earned from mining can be withdrawn. Withdrawable balance: ${withdrawableTon.toFixed(4)} TON.`,
+      miningTonBalance: withdrawableTon,
+      serverTime: Date.now(),
+    }, 400);
+  }
 
   // لا توجد رسوم على السحب نهائيًا: المبلغ المستلم = المبلغ المطلوب.
   const feeRate = 0;
   const fee = 0;
   const netAmount = Number(amount.toFixed(4));
   const newBalance = balance - amount;
+  const newMiningTon = Math.max(0, withdrawableTon - amount);
   await dbUpdate(env, `users/${telegramId}`, {
     tonBalance: newBalance,
+    miningTonBalance: newMiningTon,
     tonWallet: walletAddress,
   });
 
@@ -3172,6 +3252,7 @@ async function handleRequestWithdrawal(env, ctx) {
 
   return ok({
     tonBalance: newBalance,
+    miningTonBalance: newMiningTon,
     withdrawalId,
     requestedAmount: amount,
     fee,
@@ -3384,7 +3465,9 @@ async function handleBuyLotteryTicket(env, ctx) {
   if (tonBalance < ticketPrice) return fail('Insufficient TON balance.');
 
   const newBalance = tonBalance - ticketPrice;
-  await dbUpdate(env, `users/${user.telegramId}`, { tonBalance: newBalance });
+  const miningNowT = await loadMiningTon(env, user.telegramId, freshUser);
+  const splitT = spendTonSplit(tonBalance, miningNowT, ticketPrice);
+  await dbUpdate(env, `users/${user.telegramId}`, { tonBalance: newBalance, miningTonBalance: splitT.miningTonBalance });
   await addBalanceLog(env, user.telegramId, {
     type: 'lottery_ticket', amount: -ticketPrice, currency: 'TON', numbers: numbers, ts: Date.now(),
   });
