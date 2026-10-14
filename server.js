@@ -77,8 +77,8 @@ const DEFAULT_CONFIG = {
   // Firebase تحت config/turnstileSiteKey و config/turnstileSecretKey.
   turnstileSiteKey: '0x4AAAAAACOf6mYyukJx5XVy',
   turnstileSecretKey: '0x4AAAAAACOf6iTNX4O5_WP9Kt07Kimr8FU',
-  // كل كام إعلان (متتالي) يظهر بعده الكابتشا قبل صرف المكافأة
-  turnstileAdsInterval: 3,
+  // الكابتشا بقت *مرة واحدة فقط* عند فتح البوت (Session Captcha) — مفيش كابتشا
+  // على الإعلانات/التعدين/الديلي/الكومبو/المهام. انظر requireCaptchaSession أسفل.
   // دومين الواجهة الأمامية المتوقع (بدون https://، بدون مسار) — لو
   // اتحدد، السيرفر يرفض أي توكن Turnstile راجع منه hostname مختلف عن
   // القيمة دي (يمنع استخدام توكن اتحل على دومين تاني مع سيرفرنا).
@@ -435,8 +435,9 @@ function fail(error, status = 400) {
 
 // رد خاص يطلب من الواجهة الأمامية إظهار نافذة كابتشا Cloudflare Turnstile
 // قبل إعادة المحاولة (الواجهة تتعرف على requiresCaptcha:true وتفتح النافذة).
+// captchaSession:true = المطلوب هو كابتشا الجلسة (مرة واحدة عند فتح البوت).
 function failCaptcha(error) {
-  return json({ success: false, error, requiresCaptcha: true, serverTime: Date.now() }, 400);
+  return json({ success: false, error, requiresCaptcha: true, captchaSession: true, serverTime: Date.now() }, 400);
 }
 
 // رد خاص لحساب محظور — الواجهة الأمامية تتعرف على blocked:true فتعرض
@@ -626,6 +627,7 @@ async function verifyTelegramInitData(initData, botToken) {
       user,
       startParam: params.get('start_param') || null,
       authDate,
+      hash,
     };
   } catch (err) {
     return { valid: false, error: 'Failed to verify initData: ' + err.message };
@@ -1708,6 +1710,9 @@ async function handleGetState(env, ctx) {
     // مستخدم قديم: نثبّت رصيد التعدين القابل للسحب مرة واحدة (مش بيتأخر عليه الرد)
     dbUpdate(env, `users/${telegramId}`, { miningTonBalance: miningTonOf(user, logsRaw) }).catch(() => {});
   }
+  const withdrawalGateForState = getWithdrawalGate(config, user, logsRaw, await loadGateHistory(env));
+  // تثبيت العلامة في الخلفية (مش بنأخّر الرد على المستخدم)
+  persistGateUnlock(env, telegramId, user, withdrawalGateForState);
   const clientConfig = { ...config };
   delete clientConfig.botToken;
   delete clientConfig.turnstileSecretKey;
@@ -1747,7 +1752,7 @@ async function handleGetState(env, ctx) {
       };
     })(),
     tonBalance: Number(user.tonBalance || 0),
-    withdrawalGate: getWithdrawalGate(config, user, logsRaw),
+    withdrawalGate: withdrawalGateForState,
     tonBuckets: (() => {
       const total = Number(user.tonBalance || 0);
       const mining = miningTonOf(user, logsRaw);
@@ -2112,26 +2117,6 @@ async function handleClaimAdReward(env, ctx) {
       return fail('Daily ad limit reached');
     }
 
-    // ── كابتشا Cloudflare Turnstile كل N إعلان (افتراضيًا كل 3) ──────────
-    // totalWatchedToday هو عدد الإعلانات المُحتسبة *قبل* هذا الإعلان، فلو
-    // كان هذا الإعلان سيجعل الإجمالي مضاعفًا لـ interval، نطلب كابتشا صالحة
-    // قبل صرف المكافأة. الواجهة الأمامية تُعيد نفس الطلب (بنفس adTicket)
-    // مع turnstileToken بعد أن يحل المستخدم الكابتشا — فبنفك القفل هنا
-    // (record.claiming = false) من غير ما نحذف التذكرة، عشان تفضل صالحة
-    // للمحاولة اللي جاية بعد الكابتشا مباشرة.
-    const turnstileInterval = Math.max(1, Math.floor(Number(config.turnstileAdsInterval ?? DEFAULT_CONFIG.turnstileAdsInterval ?? 3)));
-    if ((totalWatchedToday + 1) % turnstileInterval === 0) {
-      const secretKey = config.turnstileSecretKey || env.TURNSTILE_SECRET_KEY || DEFAULT_CONFIG.turnstileSecretKey;
-      const verify = await verifyTurnstile(body.turnstileToken, ctx.ip, secretKey, {
-        expectedHostname: config.turnstileExpectedHostname || undefined,
-        expectedAction: 'ad_reward',
-      });
-      if (!verify.success) {
-        record.claiming = false;
-        return failCaptcha('You must pass the security check (Captcha) to continue and receive the ad reward');
-      }
-    }
-
     // التذكرة اتستخدمت فعليًا دلوقتي — تتحذف نهائيًا (single-use) قبل أي
     // صرف للمكافأة، فمينفعش حد يعيد استخدامها تاني مهما كانت النتيجة بعد كده.
     adNonceStore.delete(ticket);
@@ -2315,9 +2300,21 @@ async function handleBuyCrystalWithTon(env, ctx) {
   const mining = settleMiningFields(freshUser, miningRate, nowTs);
   const newTonBalance = tonBalance - tonAmount;
   // تتبّع أكبر عملية شراء لباقة (بتُستخدم في بوابة السحب)
-  const maxPurchasedTon = Math.max(Number(freshUser?.maxPurchasedTon || 0), tonAmount);
+  const prevMaxPurchased = Number(freshUser?.maxPurchasedTon || 0);
+  const maxPurchasedTon = Math.max(prevMaxPurchased, tonAmount);
   const totalPurchasedTon = Number(freshUser?.totalPurchasedTon || 0) + tonAmount;
-  await dbUpdate(env, path, { balance: crystalBalance, tonBalance: newTonBalance, ...mining, maxPurchasedTon, totalPurchasedTon });
+  // وقت أكبر شراء (بيتحدّث بس لما الشراء يكبّر الحد الأقصى) — بيُستخدم لتمييز
+  // اللي اشترى قبل تغيير سعر بوابة السحب عن اللي اشترى بعده.
+  const purchaseFields = { maxPurchasedTon, totalPurchasedTon };
+  if (tonAmount > prevMaxPurchased) purchaseFields.maxPurchasedAt = nowTs;
+  // لو المستخدم كان مفتوح له السحب قبل الشراء ده (سواء اشترى بالسعر القديم)،
+  // أو الشراء ده نفسه يحقق السعر الحالي → نثبّت العلامة الدائمة.
+  if (config.requirePackageForWithdrawal === true) {
+    const gateBefore = getWithdrawalGate(config, freshUser, null, await loadGateHistory(env));
+    const { packageTon: requiredTon } = getGatePackageTon(config);
+    if (gateBefore.earned || tonAmount + 1e-9 >= requiredTon) purchaseFields.withdrawalUnlocked = true;
+  }
+  await dbUpdate(env, path, { balance: crystalBalance, tonBalance: newTonBalance, ...mining, ...purchaseFields });
   await addBalanceLog(env, user.telegramId, {
     type: 'buy_crystal',
     amount: crystalAdded,
@@ -3092,12 +3089,59 @@ async function userHasCompletedDeposit(env, telegramId, freshUser) {
 
 // ── بوابة السحب: لازم المستخدم يكون اشترى باقة من المتجر ─────────────────
 // بترجع حالة البوابة لمستخدم معيّن بناءً على إعدادات Firebase (config/).
-// "اشترى الباقة" = عنده عملية شراء واحدة على الأقل بقيمة >= سعر الباقة المطلوبة.
-function getWithdrawalGate(config, freshUser, logsRaw) {
+// \"اشترى الباقة\" = عنده عملية شراء واحدة على الأقل بقيمة >= سعر الباقة المطلوبة.
+//
+// ⭐ حماية من اشترى قبل تغيير السعر (Grandfathering):
+// لو الأدمن رفع سعر باقة السحب (مثلاً من 1 TON لـ 2 TON)، الزيادة دي بتتطبّق
+// بس على اللي *لسه مشتراش*. اللي اشترى قبل التغيير فاضل مفتوح له السحب. ده
+// بيتحقق بـ 3 طبقات:
+//   1) علامة دائمة users/<id>/withdrawalUnlocked (بتتكتب أول ما المستخدم
+//      يستوفي الشرط فعليًا: عند الشراء أو أول ما يفتح البوت أو يطلب سحب).
+//   2) سجل تغييرات السعر meta/withdrawalGateHistory (بيتكتب تلقائيًا من الـ
+//      scheduler لما يلاقي السعر زاد): المستخدم اللي أكبر شراء له >= السعر
+//      القديم وكان قبل لحظة التغيير يعتبر مفتوح حتى لو لسه ماتكتبله العلامة.
+//   3) الشراء الجديد بعد التغيير لازم يكون >= السعر الجديد.
+function getGatePackageTon(config) {
   const packs = (Array.isArray(config.storePacks) && config.storePacks.length
     ? config.storePacks : DEFAULT_CONFIG.storePacks).map(Number).filter((n) => n > 0);
   const idx = Math.min(Math.max(1, Math.floor(Number(config.withdrawalRequiredPackage ?? 1) || 1)), packs.length);
-  const packageTon = packs[idx - 1];
+  return { packs, idx, packageTon: packs[idx - 1] };
+}
+
+let _gateHistoryCache = { at: 0, list: [] };
+async function loadGateHistory(env, force) {
+  if (!force && Date.now() - _gateHistoryCache.at < 30 * 1000) return _gateHistoryCache.list;
+  const raw = await dbGet(env, 'meta/withdrawalGateHistory').catch(() => null);
+  const list = raw
+    ? Object.values(raw)
+        .filter((e) => e && Number(e.oldTon) > 0 && Number(e.ts) > 0)
+        .map((e) => ({ oldTon: Number(e.oldTon), newTon: Number(e.newTon || 0), ts: Number(e.ts) }))
+    : [];
+  _gateHistoryCache = { at: Date.now(), list };
+  return list;
+}
+
+// بيتنادى من الـ scheduler كل دقيقة: لو سعر باقة السحب زاد، يسجّل السعر القديم
+// ولحظة التغيير في meta/withdrawalGateHistory (مرة واحدة لكل زيادة).
+async function trackWithdrawalGatePrice(env, config) {
+  const { packageTon } = getGatePackageTon(config);
+  if (!(packageTon > 0)) return;
+  const stored = await dbGet(env, 'meta/withdrawalGatePrice').catch(() => null);
+  const storedTon = Number(stored);
+  if (!stored || !Number.isFinite(storedTon) || storedTon <= 0) {
+    await dbSet(env, 'meta/withdrawalGatePrice', packageTon);
+    return;
+  }
+  if (Math.abs(storedTon - packageTon) < 1e-9) return;
+  if (packageTon > storedTon) {
+    await dbPush(env, 'meta/withdrawalGateHistory', { oldTon: storedTon, newTon: packageTon, ts: Date.now() });
+    await loadGateHistory(env, true);
+  }
+  await dbSet(env, 'meta/withdrawalGatePrice', packageTon);
+}
+
+function getWithdrawalGate(config, freshUser, logsRaw, history) {
+  const { idx, packageTon } = getGatePackageTon(config);
   const required = config.requirePackageForWithdrawal === true;
   let maxPurchased = Number(freshUser?.maxPurchasedTon || 0);
   if (!maxPurchased && logsRaw) {
@@ -3106,14 +3150,33 @@ function getWithdrawalGate(config, freshUser, logsRaw) {
       if (l && l.type === 'buy_crystal') maxPurchased = Math.max(maxPurchased, Number(l.tonSpent || 0));
     }
   }
-  const unlocked = !required || maxPurchased + 1e-9 >= packageTon;
+  const meetsCurrent = maxPurchased + 1e-9 >= packageTon;
+  // اشترى فعليًا قبل ما السعر يتزوّد؟ (مفتوح له مهما كان السعر الحالي)
+  const purchasedAt = Number(freshUser?.maxPurchasedAt || 0); // 0 = شراء قديم (قبل التحديث ده)
+  const grandfathered = freshUser?.withdrawalUnlocked === true
+    || (Array.isArray(history) && history.some((e) =>
+        maxPurchased + 1e-9 >= e.oldTon && (!purchasedAt || purchasedAt < e.ts)));
+  const unlocked = !required || meetsCurrent || grandfathered;
   return {
     required, unlocked,
     packageIndex: idx,
     packageTon,
     crystalAmount: Math.round(packageTon * Number(config.crystalPerTon ?? DEFAULT_CONFIG.crystalPerTon ?? 700)),
     maxPurchasedTon: maxPurchased,
+    // علامة تثبيت: اتحققت فعليًا (مش بس لأن البوابة مقفولة من الأدمن)
+    earned: required && (meetsCurrent || grandfathered),
   };
+}
+
+// يثبّت علامة withdrawalUnlocked على المستخدم لو استوفى الشرط فعليًا، عشان
+// أي زيادة سعر في المستقبل متمسّوش. (بتتكتب مرة واحدة بس)
+async function persistGateUnlock(env, telegramId, freshUser, gate) {
+  try {
+    if (gate && gate.earned && freshUser?.withdrawalUnlocked !== true) {
+      await dbUpdate(env, `users/${telegramId}`, { withdrawalUnlocked: true });
+      if (freshUser) freshUser.withdrawalUnlocked = true;
+    }
+  } catch (_) {}
 }
 
 async function handleRequestWithdrawal(env, ctx) {
@@ -3141,7 +3204,9 @@ async function handleRequestWithdrawal(env, ctx) {
   // ── بوابة الباقة الإلزامية (يتحكم فيها الأدمن من Firebase) ─────────────
   if (config.requirePackageForWithdrawal === true) {
     const logsRaw = freshUser?.maxPurchasedTon ? null : await dbGet(env, `balanceLogs/${telegramId}`).catch(() => null);
-    const gate = getWithdrawalGate(config, freshUser, logsRaw);
+    const gateHistory = await loadGateHistory(env);
+    const gate = getWithdrawalGate(config, freshUser, logsRaw, gateHistory);
+    await persistGateUnlock(env, telegramId, freshUser, gate);
     if (!gate.unlocked) {
       return json({
         success: false,
@@ -3592,79 +3657,72 @@ function withAdGate(gate, handler) {
 }
 
 // ════════════════════════════════════════════════════════════════════
-//  كابتشا Cloudflare Turnstile إجبارية على الأكشنات الحساسة
-//  (استلام التعدين، Daily Bonus، Daily Combo، مهام انضمام البوتات).
-//  بتتنفّذ *قبل* withAdGate وقبل أي منطق، فلو التوكن ناقص/غلط/منتهي
-//  السيرفر بيرفض الطلب برد requiresCaptcha:true، وتذكرة الإعلان (adGate)
-//  بتفضل سليمة (مش بتتحرق) عشان الواجهة تعيد نفس الطلب بعد حل الكابتشا.
-//  كل أكشن له Turnstile action خاص، فمينفعش توكن اتحل لأكشن يتستخدم في
-//  أكشن تاني. التوكن single-use من Cloudflare نفسه.
-//  shouldRequire (اختياري): دالة async (env, ctx) => boolean لتحديد هل
-//  الكابتشا مطلوبة للطلب ده (مثلًا مهام البوتات فقط).
+//  كابتشا الجلسة (Session Captcha) — Cloudflare Turnstile *مرة واحدة فقط*
+//  عند فتح البوت. المستخدم لازم يحلها عشان يقدر يبعت أي ريكويست للسيرفر
+//  (الاستثناء الوحيد: /verifyCaptcha نفسه). بعد الحل مفيش كابتشا تاني على
+//  الإعلانات ولا التعدين ولا الديلي بونص ولا الكومبو ولا المهام.
+//
+//  الجلسة مربوطة بـ (telegramId + hash بتاع initData) — يعني كل مرة تلجرام
+//  يفتح البوت بـ initData جديد، لازم تتحل كابتشا جديدة. وتتخزن في ذاكرة
+//  السيرفر؛ لو السيرفر اتعمله restart الواجهة هتطلب الكابتشا تاني تلقائيًا.
 // ════════════════════════════════════════════════════════════════════
-const CAPTCHA_ACTIONS = {
-  claimMining: 'claim_mining',
-  claimDailyBonus: 'daily_bonus',
-  checkCombo: 'daily_combo',
-  verifyTask: 'bot_task',
-};
+const captchaSessionStore = new Map();   // `${telegramId}:${initDataHash}` -> { expireAt }
 
-function withCaptcha(gate, handler, shouldRequire) {
-  const expectedAction = CAPTCHA_ACTIONS[gate];
-  return async function (env, ctx) {
-    // لو تذكرة الإعلان أصلًا مش موجودة نرفض بدون ما نضيّع حل كابتشا على المستخدم
-    const ticket = String(ctx.body.adGate || '');
-    if (!ticket || !adGateStore.has(ticket)) {
-      return fail('Please watch the ad first', 403);
-    }
-    if (shouldRequire) {
-      let required = true;
-      try { required = await shouldRequire(env, ctx); } catch (_) { required = true; }
-      if (!required) return handler(env, ctx);
-    }
-    const { config } = ctx;
-    const secretKey = config.turnstileSecretKey || env.TURNSTILE_SECRET_KEY || DEFAULT_CONFIG.turnstileSecretKey;
-    const verify = await verifyTurnstile(ctx.body.turnstileToken, ctx.ip, secretKey, {
-      expectedHostname: config.turnstileExpectedHostname || undefined,
-      expectedAction,
-    });
-    if (!verify.success) {
-      return failCaptcha('You must pass the security check (Captcha) to continue');
-    }
-    // التوكن اتحرق عند Cloudflare؛ نمسحه من الطلب عشان ميتستخدمش تاني بالغلط
-    delete ctx.body.turnstileToken;
-    return handler(env, ctx);
-  };
+function captchaSessionKey(telegramId, initDataHash) {
+  return `${telegramId}:${initDataHash || ''}`;
 }
 
-// مهام انضمام البوتات بس هي اللي بتطلب كابتشا (مهام القنوات لأ).
-// عشان تفرضها على كل المهام: غيّر الدالة لـ async () => true
-async function taskNeedsCaptcha(env, ctx) {
-  const taskId = ctx.body && ctx.body.taskId;
-  if (!isNonEmptyString(taskId, 100)) return false;   // handler هيرفض الطلب أصلًا
-  const task = await dbGet(env, `tasks/${taskId}`);
-  return isBotStyleTask(task);
+function cleanupExpiredCaptchaSessions() {
+  const now = Date.now();
+  for (const [k, rec] of captchaSessionStore) {
+    if (rec.expireAt < now) captchaSessionStore.delete(k);
+  }
+}
+
+function hasCaptchaSession(key) {
+  const rec = captchaSessionStore.get(key);
+  if (!rec) return false;
+  if (rec.expireAt < Date.now()) { captchaSessionStore.delete(key); return false; }
+  return true;
+}
+
+// POST /verifyCaptcha  { turnstileToken }  ->  { verified: true }
+async function handleVerifyCaptcha(env, ctx) {
+  const { body, config, ip, captchaKey } = ctx;
+  if (hasCaptchaSession(captchaKey)) return ok({ verified: true });
+  const secretKey = config.turnstileSecretKey || env.TURNSTILE_SECRET_KEY || DEFAULT_CONFIG.turnstileSecretKey;
+  const verify = await verifyTurnstile(body.turnstileToken, ip, secretKey, {
+    expectedHostname: config.turnstileExpectedHostname || undefined,
+    expectedAction: 'session_verify',
+  });
+  if (!verify.success) {
+    return failCaptcha('You must pass the security check (Captcha) to continue');
+  }
+  cleanupExpiredCaptchaSessions();
+  captchaSessionStore.set(captchaKey, { expireAt: Date.now() + INIT_DATA_MAX_AGE * 1000 });
+  return ok({ verified: true });
 }
 
 // ════════════════════════════════════════════════════════════════════
 //  جدول التوجيه (Routing Table)
 // ════════════════════════════════════════════════════════════════════
 const ROUTES = {
+  '/verifyCaptcha': handleVerifyCaptcha,
   '/getState': handleGetState,
   '/heartbeat': handleHeartbeat,
-  '/claimDailyBonus': withCaptcha('claimDailyBonus', withAdGate('claimDailyBonus', handleClaimDailyBonus)),
+  '/claimDailyBonus': withAdGate('claimDailyBonus', handleClaimDailyBonus),
   '/redeemCode': withAdGate('redeemCode', handleRedeemCode),
   '/checkSession': handleStartAdView,
   '/adGateStart': handleAdGateStart,
   '/syncBalance': handleClaimAdReward,
   '/sessionSync': handleSessionSync,
   '/startMining': handleStartMining,
-  '/claimMining': withCaptcha('claimMining', withAdGate('claimMining', handleClaimMining)),
+  '/claimMining': withAdGate('claimMining', handleClaimMining),
   '/startTask': handleStartTask,
-  '/verifyTask': withCaptcha('verifyTask', withAdGate('verifyTask', handleVerifyTask), taskNeedsCaptcha),
+  '/verifyTask': withAdGate('verifyTask', handleVerifyTask),
   '/claimTask': withAdGate('claimTask', handleClaimTask),
   '/submitTaskSuggestion': handleSubmitTaskSuggestion,
-  '/checkCombo': withCaptcha('checkCombo', withAdGate('checkCombo', handleCheckCombo)),
+  '/checkCombo': withAdGate('checkCombo', handleCheckCombo),
   '/collectReferralEarnings': handleCollectReferralEarnings,
   '/spinWheel': handleSpinWheel,
   '/getReferrals': handleGetReferrals,
@@ -3803,7 +3861,13 @@ async function handleFetch(request, env) {
       }
       // ─────────────────────────────────────────────────────────────
 
-      const ctx = { user, body, tgUser: verification.user, config, botToken, botUsername, fraudResult, ip };
+      // ── كابتشا الجلسة: إجبارية مرة واحدة عند فتح البوت قبل أي ريكويست ──
+      const captchaKey = captchaSessionKey(user.telegramId, verification.hash);
+      if (path !== '/verifyCaptcha' && !hasCaptchaSession(captchaKey)) {
+        return failCaptcha('You must pass the security check (Captcha) to continue');
+      }
+
+      const ctx = { user, body, tgUser: verification.user, config, botToken, botUsername, fraudResult, ip, captchaKey };
       return await handler(env, ctx);
     } catch (err) {
       return fail('A server error occurred: ' + err.message, 500);
@@ -3883,6 +3947,11 @@ async function runScheduled() {
       await getOrCreateTodayCombo(process.env, config);
     } catch (err) {
       console.error('⚠️ Daily combo creation failed:', err.message);
+    }
+    try {
+      await trackWithdrawalGatePrice(process.env, config);
+    } catch (err) {
+      console.error('⚠️ Withdrawal gate price tracking failed:', err.message);
     }
     try {
       await ensureWeeklyContestUpToDate(process.env, config);
