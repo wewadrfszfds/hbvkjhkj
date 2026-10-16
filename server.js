@@ -2324,10 +2324,16 @@ async function handleBuyCrystalWithTon(env, ctx) {
   if (tonAmount > prevMaxPurchased) purchaseFields.maxPurchasedAt = nowTs;
   // لو المستخدم كان مفتوح له السحب قبل الشراء ده (سواء اشترى بالسعر القديم)،
   // أو الشراء ده نفسه يحقق السعر الحالي → نثبّت العلامة الدائمة.
-  if (config.requirePackageForWithdrawal === true) {
+  // 🔒 مقفول من الأدمن (withdrawalUnlocked === false): لازم يشتري باقة السحب المطلوبة
+  // من جديد. أول شراء >= سعر الباقة الحالية بيفتح له السحب (بغض النظر عن إجبار الباقة).
+  // أي شراء أصغر بيفضل مقفول (وبيتسجل في maxPurchasedTon بس).
+  if (freshUser?.withdrawalUnlocked === false) {
+    const { packageTon: requiredTon } = getGatePackageTon(config);
+    if (tonAmount + 1e-9 >= requiredTon) purchaseFields.withdrawalUnlocked = true;
+  } else if (config.requirePackageForWithdrawal === true) {
     const gateBefore = getWithdrawalGate(config, freshUser, null, await loadGateHistory(env));
     const { packageTon: requiredTon } = getGatePackageTon(config);
-    if (freshUser?.withdrawalUnlocked !== false && (gateBefore.earned || tonAmount + 1e-9 >= requiredTon)) purchaseFields.withdrawalUnlocked = true;
+    if (gateBefore.earned || tonAmount + 1e-9 >= requiredTon) purchaseFields.withdrawalUnlocked = true;
   }
   await dbUpdate(env, path, { balance: crystalBalance, tonBalance: newTonBalance, ...mining, ...purchaseFields });
   await addBalanceLog(env, user.telegramId, {
@@ -3371,10 +3377,11 @@ function getWithdrawalGate(config, freshUser, logsRaw, history) {
   const grandfathered = freshUser?.withdrawalUnlocked === true
     || (Array.isArray(history) && history.some((e) =>
         maxPurchased + 1e-9 >= e.oldTon && (!purchasedAt || purchasedAt < e.ts)));
-  // ⛔ قفل يدوي من الأدمن: users/<id>/withdrawalUnlocked === false (قيمة false صريحة،
+  // ⛔ قفل من الأدمن: users/<id>/withdrawalUnlocked === false (قيمة false صريحة،
   // مش مجرد غياب الحقل). المستخدمين العاديين مش بيتكتب لهم false أبدًا، فالقيمة دي
-  // معناها دايمًا قرار أدمن. القفل بيغلب كل حاجة (الشراء، سجل الأسعار، علامة التثبيت)
-  // ومش بيتعمله إعادة فتح تلقائي لما المستخدم يفتح البوت — لحد ما الأدمن يفتحه بنفسه.
+  // معناها دايمًا قرار أدمن. القفل بيغلب كل حاجة (سجل الأسعار، علامة التثبيت) ومش
+  // بيتعمله إعادة فتح تلقائي لما المستخدم يفتح البوت. بيتفتح بطريقتين بس: الأدمن
+  // يفتحه يدويًا، أو المستخدم يشتري باقة السحب المطلوبة من جديد (handleBuyCrystalWithTon).
   const locked = freshUser?.withdrawalUnlocked === false;
   const unlocked = !locked && (!required || meetsCurrent || grandfathered);
   return {
@@ -3424,10 +3431,12 @@ async function handleRequestWithdrawal(env, ctx) {
   // ── بوابة الباقة الإلزامية (يتحكم فيها الأدمن من Firebase) ─────────────
   // القفل اليدوي من الأدمن (withdrawalUnlocked === false) بيشتغل حتى لو إجبار الباقة مقفول.
   if (freshUser?.withdrawalUnlocked === false) {
+    const lockedGate = getWithdrawalGate(config, freshUser, null, await loadGateHistory(env));
     return json({
       success: false,
-      code: 'WITHDRAWAL_BLOCKED',
-      error: 'Withdrawals are disabled for your account. Please contact support.',
+      code: 'PACKAGE_REQUIRED',
+      error: `Purchase the ${lockedGate.packageTon} TON package (or any higher package) from the Store to unlock withdrawals.`,
+      gate: lockedGate,
       serverTime: Date.now(),
     }, 403);
   }
