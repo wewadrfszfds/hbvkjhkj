@@ -129,6 +129,15 @@ const DEFAULT_CONFIG = {
   // Firebase تحت config/weeklyContestPrizesTon (لازم تفضل 10 عناصر بالظبط).
   weeklyContestPrizesTon: [1, 0.5, 0.5, 0.25, 0.25, 0.1, 0.1, 0.1, 0.1, 0.1],
 
+  // ═══════ مسابقة الإعلانات الأسبوعية (Weekly Ads Contest) ═══════
+  // نفس نظام مسابقة الإحالات بالظبط لكن بتعدّ عدد الإعلانات اللي المستخدم
+  // شاهدها (واستلم مكافأتها فعليًا) خلال فترة المسابقة. الجوائز بنقاط
+  // CRYSTAL بدل TON، بنفس النسب (1 TON = 1000 CRYSTAL).
+  // قابلة للتعديل من Firebase تحت config/adsContestDurationMs و
+  // config/adsContestPrizesCrystal (لازم تفضل 10 عناصر بالظبط).
+  adsContestDurationMs: 7 * 24 * 60 * 60 * 1000,
+  adsContestPrizesCrystal: [1000, 500, 500, 250, 250, 100, 100, 100, 100, 100],
+
   // ═══════ اللوتري (Lottery) ═══════
   // كل جولة: يُباع عدد ثابت من التذاكر بسعر ثابت بعملة TON، وكل تذكرة
   // فيها 3 أرقام (0-9) يختارها اللاعب بالترتيب. لما يكتمل عدد التذاكر
@@ -2132,6 +2141,12 @@ async function handleClaimAdReward(env, ctx) {
       totalAdsWatched: Number(freshUser?.totalAdsWatched || 0) + 1,
     });
     await addBalanceLog(env, user.telegramId, { type: 'ad_reward', amount: reward, date: today, ts: Date.now() });
+    // مسابقة الإعلانات الأسبوعية: نعدّ الإعلان ده للمستخدم (فشل العدّ ميأثرش على المكافأة)
+    try {
+      await recordAdsContestView(env, config, user.telegramId);
+    } catch (err) {
+      console.error('⚠️ Ads contest count failed:', err.message);
+    }
     if (watched + 1 >= 10) {
       await activateReferralIfNeeded(env, user.telegramId, config);
     }
@@ -3050,6 +3065,204 @@ async function handleGetWeeklyLeaderboard(env, ctx) {
   });
 }
 
+// ════════════════════════════════════════════════════════════════════
+//  مسابقة الإعلانات الأسبوعية (Weekly Ads Leaderboard/Contest)
+// ════════════════════════════════════════════════════════════════════
+//  نفس نظام مسابقة الإحالات، البنية داخل Firebase:
+//   adsContest/state                          -> { periodId, startTs, endTs }
+//   adsContest/counts/{periodId}/{telegramId} -> { count, lastTs }
+//   adsContest/history/{periodId}             -> نتائج الأسبوع المنتهي (وقفل
+//                                                لمنع صرف نفس الأسبوع مرتين)
+//  كل إعلان يتم استلام مكافأته بنجاح في handleClaimAdReward بيزوّد عدّاد
+//  المستخدم في الفترة الحالية. عند التعادل، الأسبق في الوصول لآخر رقم
+//  (lastTs أقدم) هو الأعلى ترتيبًا.
+// ════════════════════════════════════════════════════════════════════
+
+function adsContestPrizes(config) {
+  const arr = Array.isArray(config?.adsContestPrizesCrystal) && config.adsContestPrizesCrystal.length === 10
+    ? config.adsContestPrizesCrystal
+    : DEFAULT_CONFIG.adsContestPrizesCrystal;
+  return arr.map((n) => Math.max(0, Math.floor(Number(n) || 0)));
+}
+
+function adsContestDuration(config) {
+  const n = Number(config?.adsContestDurationMs);
+  return Number.isFinite(n) && n > 0 ? n : DEFAULT_CONFIG.adsContestDurationMs;
+}
+
+function makeAdsPeriodId(startTs) {
+  return `ac_${startTs}`;
+}
+
+async function getOrInitAdsContestState(env, config) {
+  let state = await dbGet(env, 'adsContest/state');
+  if (!state || !state.startTs || !state.endTs) {
+    const startTs = Date.now();
+    state = { periodId: makeAdsPeriodId(startTs), startTs, endTs: startTs + adsContestDuration(config) };
+    await dbSet(env, 'adsContest/state', state);
+  }
+  return state;
+}
+
+// يرجّع كل المستخدمين اللي شاهدوا إعلان واحد على الأقل في الفترة، مرتبين
+// تنازليًا حسب العدد ثم الأسبق وصولًا. بيجيب بيانات المستخدمين (الاسم/الصورة)
+// فقط لأول `limit` صفوف عشان منقرأش كل جدول users.
+async function computeAdsLeaderboard(env, periodId, limit = 25) {
+  const counts = await dbGet(env, `adsContest/counts/${periodId}`);
+  const rows = [];
+  if (counts && typeof counts === 'object') {
+    for (const [telegramId, c] of Object.entries(counts)) {
+      const count = Number(c?.count || 0);
+      if (count > 0) rows.push({ telegramId, count, earliestTs: Number(c?.lastTs || 0) });
+    }
+  }
+  rows.sort((a, b) => {
+    if (b.count !== a.count) return b.count - a.count;
+    if (a.earliestTs !== b.earliestTs) return a.earliestTs - b.earliestTs;
+    return String(a.telegramId).localeCompare(String(b.telegramId));
+  });
+  await Promise.all(rows.slice(0, limit).map(async (row) => {
+    const u = (await dbGet(env, `users/${row.telegramId}`).catch(() => null)) || {};
+    row.firstName = u.firstName || '';
+    row.username = u.username || '';
+    row.photoUrl = u.photoUrl || '';
+  }));
+  return rows;
+}
+
+async function finalizeAndAdvanceAdsPeriod(env, config, state) {
+  const periodId = state.periodId || makeAdsPeriodId(state.startTs);
+  const historyPath = `adsContest/history/${periodId}`;
+
+  const existingHistory = await dbGet(env, historyPath);
+  if (!existingHistory || (!existingHistory.distributed && !existingHistory.distributing)) {
+    // قفل مبدئي قبل أي صرف — يمنع الصرف المزدوج.
+    await dbSet(env, historyPath, {
+      startTs: state.startTs,
+      endTs: state.endTs,
+      distributed: false,
+      distributing: true,
+      lockedAt: Date.now(),
+    });
+
+    const prizes = adsContestPrizes(config);
+    const leaderboard = await computeAdsLeaderboard(env, periodId, prizes.length);
+    const winners = [];
+
+    for (let i = 0; i < prizes.length; i++) {
+      const row = leaderboard[i];
+      const prizeCrystal = prizes[i];
+      if (!row || !(prizeCrystal > 0)) continue;
+      try {
+        await incrementBalance(env, row.telegramId, prizeCrystal);
+        await addBalanceLog(env, row.telegramId, {
+          type: 'weekly_ads_contest_prize',
+          amount: prizeCrystal,
+          currency: 'CRYSTAL',
+          rank: i + 1,
+          adsCount: row.count,
+          periodId,
+          ts: Date.now(),
+        });
+        await sendTelegramMessage(env, config.botToken || '', row.telegramId,
+          `🏆 Weekly Ads Contest results!\n\nYou finished #${i + 1} this week with ${row.count} ad${row.count === 1 ? '' : 's'} watched.\n\n💎 +${prizeCrystal} CRYSTAL has been credited to your balance automatically.\n\n🔄 A brand new weekly ads contest just started — watch ads to compete again!`);
+        winners.push({ rank: i + 1, telegramId: row.telegramId, firstName: row.firstName, username: row.username, photoUrl: row.photoUrl, count: row.count, prizeCrystal });
+      } catch (err) {
+        winners.push({ rank: i + 1, telegramId: row.telegramId, count: row.count, prizeCrystal, error: String(err && err.message || err) });
+      }
+    }
+
+    await dbSet(env, historyPath, {
+      startTs: state.startTs,
+      endTs: state.endTs,
+      distributed: true,
+      distributing: false,
+      distributedAt: Date.now(),
+      totalPrizeCrystal: winners.reduce((sum, w) => sum + (w.error ? 0 : w.prizeCrystal), 0),
+      winners,
+    });
+  }
+
+  const nextStartTs = state.endTs;
+  const nextState = {
+    periodId: makeAdsPeriodId(nextStartTs),
+    startTs: nextStartTs,
+    endTs: nextStartTs + adsContestDuration(config),
+  };
+  await dbSet(env, 'adsContest/state', nextState);
+  return nextState;
+}
+
+async function ensureAdsContestUpToDate(env, config) {
+  let state = await getOrInitAdsContestState(env, config);
+  let guard = 0;
+  while (Date.now() >= state.endTs && guard < 60) {
+    state = await finalizeAndAdvanceAdsPeriod(env, config, state);
+    guard++;
+  }
+  return state;
+}
+
+// بيتنادى بعد كل إعلان اتسلّمت مكافأته بنجاح — بيزوّد عدّاد المستخدم في
+// الفترة الحالية. أي فشل هنا ميأثرش على مكافأة الإعلان نفسها.
+async function recordAdsContestView(env, config, telegramId) {
+  const state = await ensureAdsContestUpToDate(env, config);
+  const path = `adsContest/counts/${state.periodId}/${telegramId}`;
+  const cur = await dbGet(env, path);
+  await dbSet(env, path, { count: Number(cur?.count || 0) + 1, lastTs: Date.now() });
+}
+
+// ───────────────────────── POST /getAdsLeaderboard ─────────────────────────
+async function handleGetAdsLeaderboard(env, ctx) {
+  const { user, config } = ctx;
+  const state = await ensureAdsContestUpToDate(env, config);
+  const prizes = adsContestPrizes(config);
+  const TOP_LIMIT = 25;
+  const leaderboard = await computeAdsLeaderboard(env, state.periodId, TOP_LIMIT);
+
+  const top = leaderboard.slice(0, TOP_LIMIT).map((row, i) => ({
+    rank: i + 1,
+    telegramId: row.telegramId,
+    firstName: row.firstName,
+    username: row.username,
+    photoUrl: row.photoUrl,
+    adsThisWeek: row.count,
+    prizeCrystal: prizes[i] || 0,
+  }));
+
+  const myIndex = leaderboard.findIndex((r) => String(r.telegramId) === String(user.telegramId));
+  let myRank = myIndex >= 0 ? myIndex + 1 : null;
+  let myAds = myIndex >= 0 ? leaderboard[myIndex].count : 0;
+  if (myIndex < 0) {
+    // المستخدم برا أعلى 25: نجيب عدّاده ونحسب ترتيبه الفعلي
+    const mine = await dbGet(env, `adsContest/counts/${state.periodId}/${user.telegramId}`).catch(() => null);
+    myAds = Number(mine?.count || 0);
+    if (myAds > 0) {
+      const all = await dbGet(env, `adsContest/counts/${state.periodId}`);
+      const myTs = Number(mine?.lastTs || 0);
+      let ahead = 0;
+      for (const [id, c] of Object.entries(all || {})) {
+        if (String(id) === String(user.telegramId)) continue;
+        const cn = Number(c?.count || 0);
+        if (cn > myAds || (cn === myAds && Number(c?.lastTs || 0) < myTs)) ahead++;
+      }
+      myRank = ahead + 1;
+    }
+  }
+
+  return ok({
+    weekStartTs: state.startTs,
+    weekEndTs: state.endTs,
+    prizesCrystal: prizes,
+    totalPrizePoolCrystal: prizes.reduce((sum, n) => sum + n, 0),
+    leaderboard: top,
+    topLimit: TOP_LIMIT,
+    myRank,
+    myAdsThisWeek: myAds,
+    note: 'Ranking is based on the number of ads watched since the start of this round.',
+  });
+}
+
 // ───────────────────────── POST /getReferrals ─────────────────────────
 async function handleGetReferrals(env, ctx) {
   const { user } = ctx;
@@ -3727,6 +3940,7 @@ const ROUTES = {
   '/spinWheel': handleSpinWheel,
   '/getReferrals': handleGetReferrals,
   '/getWeeklyLeaderboard': handleGetWeeklyLeaderboard,
+  '/getAdsLeaderboard': handleGetAdsLeaderboard,
   '/checkForceSub': handleCheckForceSub,
   '/requestWithdrawal': withAdGate('requestWithdrawal', handleRequestWithdrawal),
   '/createDeposit': handleCreateDeposit,
@@ -3957,6 +4171,11 @@ async function runScheduled() {
       await ensureWeeklyContestUpToDate(process.env, config);
     } catch (err) {
       console.error('⚠️ Weekly contest check failed:', err.message);
+    }
+    try {
+      await ensureAdsContestUpToDate(process.env, config);
+    } catch (err) {
+      console.error('⚠️ Ads contest check failed:', err.message);
     }
   } catch (err) {
     console.error('⚠️ getConfig failed in scheduled:', err.message);
