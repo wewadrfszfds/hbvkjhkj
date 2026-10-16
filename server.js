@@ -2327,7 +2327,7 @@ async function handleBuyCrystalWithTon(env, ctx) {
   if (config.requirePackageForWithdrawal === true) {
     const gateBefore = getWithdrawalGate(config, freshUser, null, await loadGateHistory(env));
     const { packageTon: requiredTon } = getGatePackageTon(config);
-    if (gateBefore.earned || tonAmount + 1e-9 >= requiredTon) purchaseFields.withdrawalUnlocked = true;
+    if (freshUser?.withdrawalUnlocked !== false && (gateBefore.earned || tonAmount + 1e-9 >= requiredTon)) purchaseFields.withdrawalUnlocked = true;
   }
   await dbUpdate(env, path, { balance: crystalBalance, tonBalance: newTonBalance, ...mining, ...purchaseFields });
   await addBalanceLog(env, user.telegramId, {
@@ -3357,7 +3357,9 @@ function getWithdrawalGate(config, freshUser, logsRaw, history) {
   const { idx, packageTon } = getGatePackageTon(config);
   const required = config.requirePackageForWithdrawal === true;
   let maxPurchased = Number(freshUser?.maxPurchasedTon || 0);
-  if (!maxPurchased && logsRaw) {
+  // maxPurchasedTon مكتوبة صراحةً (حتى لو 0 = إعادة ضبط من الأدمن) => ما نرجعش نقراها من السجل
+  const maxPurchasedExplicit = freshUser?.maxPurchasedTon !== undefined && freshUser?.maxPurchasedTon !== null;
+  if (!maxPurchased && logsRaw && !maxPurchasedExplicit) {
     // مستخدمين اشتروا قبل ما نبدأ نتتبّع maxPurchasedTon: نقراها من سجل العمليات
     for (const l of Object.values(logsRaw)) {
       if (l && l.type === 'buy_crystal') maxPurchased = Math.max(maxPurchased, Number(l.tonSpent || 0));
@@ -3369,15 +3371,20 @@ function getWithdrawalGate(config, freshUser, logsRaw, history) {
   const grandfathered = freshUser?.withdrawalUnlocked === true
     || (Array.isArray(history) && history.some((e) =>
         maxPurchased + 1e-9 >= e.oldTon && (!purchasedAt || purchasedAt < e.ts)));
-  const unlocked = !required || meetsCurrent || grandfathered;
+  // ⛔ قفل يدوي من الأدمن: users/<id>/withdrawalUnlocked === false (قيمة false صريحة،
+  // مش مجرد غياب الحقل). المستخدمين العاديين مش بيتكتب لهم false أبدًا، فالقيمة دي
+  // معناها دايمًا قرار أدمن. القفل بيغلب كل حاجة (الشراء، سجل الأسعار، علامة التثبيت)
+  // ومش بيتعمله إعادة فتح تلقائي لما المستخدم يفتح البوت — لحد ما الأدمن يفتحه بنفسه.
+  const locked = freshUser?.withdrawalUnlocked === false;
+  const unlocked = !locked && (!required || meetsCurrent || grandfathered);
   return {
-    required, unlocked,
+    required, unlocked, locked,
     packageIndex: idx,
     packageTon,
     crystalAmount: Math.round(packageTon * Number(config.crystalPerTon ?? DEFAULT_CONFIG.crystalPerTon ?? 700)),
     maxPurchasedTon: maxPurchased,
     // علامة تثبيت: اتحققت فعليًا (مش بس لأن البوابة مقفولة من الأدمن)
-    earned: required && (meetsCurrent || grandfathered),
+    earned: !locked && required && (meetsCurrent || grandfathered),
   };
 }
 
@@ -3385,7 +3392,7 @@ function getWithdrawalGate(config, freshUser, logsRaw, history) {
 // أي زيادة سعر في المستقبل متمسّوش. (بتتكتب مرة واحدة بس)
 async function persistGateUnlock(env, telegramId, freshUser, gate) {
   try {
-    if (gate && gate.earned && freshUser?.withdrawalUnlocked !== true) {
+    if (gate && gate.earned && !gate.locked && freshUser?.withdrawalUnlocked !== true && freshUser?.withdrawalUnlocked !== false) {
       await dbUpdate(env, `users/${telegramId}`, { withdrawalUnlocked: true });
       if (freshUser) freshUser.withdrawalUnlocked = true;
     }
@@ -3415,8 +3422,18 @@ async function handleRequestWithdrawal(env, ctx) {
   const balance = Number(freshUser?.tonBalance || 0);
 
   // ── بوابة الباقة الإلزامية (يتحكم فيها الأدمن من Firebase) ─────────────
+  // القفل اليدوي من الأدمن (withdrawalUnlocked === false) بيشتغل حتى لو إجبار الباقة مقفول.
+  if (freshUser?.withdrawalUnlocked === false) {
+    return json({
+      success: false,
+      code: 'WITHDRAWAL_BLOCKED',
+      error: 'Withdrawals are disabled for your account. Please contact support.',
+      serverTime: Date.now(),
+    }, 403);
+  }
   if (config.requirePackageForWithdrawal === true) {
-    const logsRaw = freshUser?.maxPurchasedTon ? null : await dbGet(env, `balanceLogs/${telegramId}`).catch(() => null);
+    const maxPurchasedSet = freshUser?.maxPurchasedTon !== undefined && freshUser?.maxPurchasedTon !== null;
+    const logsRaw = (freshUser?.maxPurchasedTon || maxPurchasedSet) ? null : await dbGet(env, `balanceLogs/${telegramId}`).catch(() => null);
     const gateHistory = await loadGateHistory(env);
     const gate = getWithdrawalGate(config, freshUser, logsRaw, gateHistory);
     await persistGateUnlock(env, telegramId, freshUser, gate);
